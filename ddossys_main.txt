@@ -1,0 +1,197 @@
+"""
+ML-Powered DDoS Detector - Optimized for Zeek Logs
+Uses model trained on Zeek-compatible features
+"""
+
+import pandas as pd
+import numpy as np
+import joblib
+import time
+from pathlib import Path
+from datetime import datetime
+import sys
+
+print("="*70)
+print("ZEEK-OPTIMIZED ML DDoS DETECTOR")
+print("Random Forest | Real-Time Detection")
+print("="*70)
+
+# Load Zeek-optimized model
+print("\n📦 Loading ML Model...")
+try:
+    model = joblib.load('models/zeek_model.pkl')
+    scaler = joblib.load('models/zeek_scaler.pkl')
+    features = joblib.load('models/zeek_features.pkl')
+    print(f"✅ Model loaded: RandomForestClassifier")
+    print(f"✅ Features: {len(features)} features")
+    print(f"   {features[:10]}...")
+except Exception as e:
+    print(f"❌ Error loading model: {e}")
+    print("   Run: python scripts/train_zeek_model.py first")
+    sys.exit(1)
+
+# Find Zeek log
+conn_log = Path.home() / "zeek_fresh_logs/conn.log"
+if not conn_log.exists():
+    conn_log = Path.home() / "conn.log"
+
+if not conn_log.exists():
+    print("❌ Zeek log not found!")
+    sys.exit(1)
+
+print(f"📁 Monitoring: {conn_log}")
+print(f"   Size: {conn_log.stat().st_size / (1024*1024):.1f} MB")
+
+def parse_zeek_flow(line):
+    """Extract features from Zeek conn.log that match our model"""
+    parts = line.strip().split('\t')
+    if len(parts) >= 17 and not line.startswith('#'):
+        try:
+            duration = float(parts[8]) if parts[8] != '-' else 0
+            orig_bytes = int(parts[9]) if parts[9] != '-' else 0
+            resp_bytes = int(parts[10]) if parts[10] != '-' else 0
+            orig_pkts = int(parts[14]) if parts[14] != '-' else 0
+            resp_pkts = int(parts[16]) if parts[16] != '-' else 0
+            conn_state = parts[11]
+            
+            return {
+                'duration': duration,
+                'orig_bytes': orig_bytes,
+                'resp_bytes': resp_bytes,
+                'orig_pkts': orig_pkts,
+                'resp_pkts': resp_pkts,
+                'conn_state': conn_state
+            }
+        except (ValueError, IndexError):
+            pass
+    return None
+
+def extract_features(flows):
+    """Extract features for ML model from a window of flows"""
+    if not flows:
+        return None
+    
+    total_packets = sum(f['orig_pkts'] + f['resp_pkts'] for f in flows)
+    total_bytes = sum(f['orig_bytes'] + f['resp_bytes'] for f in flows)
+    total_duration = sum(f['duration'] for f in flows)
+    syn_count = sum(1 for f in flows if f['conn_state'] == 'S0')
+    flow_count = len(flows)
+    
+    features_dict = {}
+    
+    # Map Zeek data to model features
+    for feat in features:
+        if 'Flow Duration' in feat or 'duration' in feat.lower():
+            features_dict[feat] = total_duration / max(flow_count, 1)
+        elif 'Total Fwd Packets' in feat or 'orig_pkts' in feat:
+            features_dict[feat] = sum(f['orig_pkts'] for f in flows)
+        elif 'Total Backward Packets' in feat or 'resp_pkts' in feat:
+            features_dict[feat] = sum(f['resp_pkts'] for f in flows)
+        elif 'Total Length of Fwd Packets' in feat or 'orig_bytes' in feat:
+            features_dict[feat] = sum(f['orig_bytes'] for f in flows)
+        elif 'Total Length of Bwd Packets' in feat or 'resp_bytes' in feat:
+            features_dict[feat] = sum(f['resp_bytes'] for f in flows)
+        elif 'Flow Bytes/s' in feat:
+            features_dict[feat] = total_bytes / max(total_duration, 0.001)
+        elif 'Flow Packets/s' in feat:
+            features_dict[feat] = total_packets / max(total_duration, 0.001)
+        elif 'SYN Flag Count' in feat:
+            features_dict[feat] = syn_count
+        else:
+            features_dict[feat] = 0
+    
+    return features_dict
+
+# Detection loop
+last_pos = 0
+window_flows = []
+window_start = time.time()
+window_size = 5  # Shorter window for faster detection
+alert_count = 0
+check_count = 0
+
+print(f"\n🔬 ML Detection Active")
+print(f"   Window: {window_size}s")
+print(f"   Features: {len(features)}")
+print("\n   Press Ctrl+C to stop\n")
+
+try:
+    while True:
+        if conn_log.exists():
+            with open(conn_log, 'r') as f:
+                f.seek(last_pos)
+                for line in f:
+                    flow = parse_zeek_flow(line)
+                    if flow:
+                        window_flows.append(flow)
+                last_pos = f.tell()
+        
+        current_time = time.time()
+        if current_time - window_start >= window_size:
+            check_count += 1
+            
+            if window_flows and len(window_flows) > 5:
+                # Extract features
+                features_dict = extract_features(window_flows)
+                
+                if features_dict:
+                    # Prepare for ML
+                    X = pd.DataFrame([features_dict])
+                    X_ml = X[features].fillna(0).replace([np.inf, -np.inf], 0)
+                    X_scaled = scaler.transform(X_ml)
+                    
+                    # ML Prediction
+                    prediction = model.predict(X_scaled)[0]
+                    proba = model.predict_proba(X_scaled)[0]
+                    
+                    # Calculate stats
+                    total_packets = sum(f['orig_pkts'] + f['resp_pkts'] for f in window_flows)
+                    syn_count = sum(1 for f in window_flows if f['conn_state'] == 'S0')
+                    rate = total_packets / window_size
+                    
+                    # Determine if DDoS (ML confidence > 60% OR high packet rate)
+                    is_ddos = (prediction == 1 and proba[1] > 0.6) or (rate > 1000)
+                    
+                    if is_ddos:
+                        alert_count += 1
+                        print(f"\n{'='*70}")
+                        print(f"🚨 DDoS ATTACK DETECTED! 🚨")
+                        print(f"{'='*70}")
+                        print(f"Alert #{alert_count} | Time: {datetime.now().strftime('%H:%M:%S')}")
+                        print(f"\n🤖 ML Model Analysis:")
+                        print(f"   Prediction: {'DDoS' if prediction == 1 else 'Benign'}")
+                        print(f"   Confidence: {proba[1] if prediction == 1 else proba[0]:.2%}")
+                        print(f"   Features Analyzed: {len(features)}")
+                        print(f"\n📊 Traffic Statistics:")
+                        print(f"   Packet Rate: {rate:.0f}/sec")
+                        print(f"   Total Packets: {total_packets}")
+                        print(f"   SYN Flood Indicator: {syn_count}")
+                        print(f"   Flows: {len(window_flows)}")
+                        print(f"\n🔧 ML Model: Random Forest")
+                        print(f"{'='*70}\n")
+                        
+                        # Save alert
+                        with open("zeek_ddos_alerts.log", "a") as f:
+                            f.write(f"{datetime.now()}\tDDoS\tConf:{proba[1]:.2%}\tRate:{rate:.0f}\tSYN:{syn_count}\n")
+                    else:
+                        # Show progress every 10 checks
+                        if check_count % 10 == 0:
+                            status = "⚠️  HIGH TRAFFIC" if rate > 500 else "✅ BENIGN"
+                            print(f"\r[{datetime.now().strftime('%H:%M:%S')}] {status} | Rate: {rate:.0f}/sec | ML Conf: {proba[1]:.2%} | Alerts: {alert_count}", end='')
+            
+            # Reset window
+            window_flows = []
+            window_start = current_time
+        
+        time.sleep(0.5)
+
+except KeyboardInterrupt:
+    print(f"\n\n{'='*70}")
+    print("DETECTION SUMMARY")
+    print(f"{'='*70}")
+    print(f"Total Alerts: {alert_count}")
+    print(f"Windows Analyzed: {check_count}")
+    print(f"ML Model: Random Forest Classifier")
+    print(f"Features: {len(features)}")
+    print(f"\nLog saved: zeek_ddos_alerts.log")
+    print(f"{'='*70}")
